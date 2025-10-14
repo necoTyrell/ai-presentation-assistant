@@ -1,13 +1,35 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
+import logging
 from app.api import upload, generate
 from app.core.embeddings import document_index
 from app.core.llm_generator import content_generator
 
-app = FastAPI(title="AI Presentation Assistant")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("🚀 AI Presentation Assistant starting up...")
+    health = content_generator.health_check()
+    logger.info(f"LLM Model status: {health}")
+    yield
+    # Shutdown
+    logger.info("🛑 AI Presentation Assistant shutting down...")
+
+
+app = FastAPI(
+    title="AI Presentation Assistant",
+    description="Сервис для автоматической генерации инвестиционных презентаций",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Подключаем только upload и generate
 app.include_router(upload.router, prefix="/upload", tags=["upload"])
 app.include_router(generate.router, prefix="/generate", tags=["generate"])
-app.include_router(llm.router, prefix="/llm", tags=["llm"])
 
 
 @app.get("/")
@@ -17,8 +39,8 @@ def root():
         "endpoints": {
             "upload": "/upload",
             "generate": "/generate/presentation",
-            "llm_test": "/llm/test-generate",
-            "llm_status": "/llm/model-status"
+            "llm_test": "/generate/test-llm",
+            "llm_status": "/generate/llm-status"
         }
     }
 
@@ -27,7 +49,17 @@ def root():
 def health_check():
     """Проверка здоровья всех компонентов системы"""
     model_health = content_generator.health_check()
-    documents_loaded = len(document_index.texts) > 0
+
+    # Безопасная проверка document_index
+    try:
+        documents_loaded = len(document_index.documents) > 0
+        documents_count = len(document_index.documents)
+        index_built = document_index.is_built
+    except Exception as e:
+        logger.error(f"Error checking document index: {e}")
+        documents_loaded = False
+        documents_count = 0
+        index_built = False
 
     return {
         "status": "healthy" if model_health["status"] in ["healthy", "loaded"] else "degraded",
@@ -35,8 +67,8 @@ def health_check():
             "llm_model": model_health,
             "document_index": {
                 "loaded": documents_loaded,
-                "documents_count": len(document_index.texts),
-                "index_built": document_index.index is not None
+                "documents_count": documents_count,
+                "index_built": index_built
             }
         }
     }

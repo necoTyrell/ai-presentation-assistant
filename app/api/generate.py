@@ -1,15 +1,24 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+import io
 import logging
-
+import uuid
+from datetime import datetime
+from app.core.pptx_builder import PresentationBuilder
+from app.core.embeddings import document_index
 from app.core.llm_generator import content_generator
 from tests.test_prompts import get_slide_prompt
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# In-memory storage for generation status
+generation_status = {}
 
+
+# ========== MODELS ==========
 class GenerationTestRequest(BaseModel):
     slide_type: str
     context: str
@@ -30,10 +39,6 @@ class BatchTestRequest(BaseModel):
     audience: str = "инвесторы"
 
 
-class BatchTestResponse(BaseModel):
-    results: Dict[str, Any]
-
-
 class ModelHealthResponse(BaseModel):
     status: str
     model: str
@@ -41,9 +46,43 @@ class ModelHealthResponse(BaseModel):
     error: Optional[str] = None
 
 
-@router.post("/test-generate", response_model=GenerationTestResponse)
-async def test_generation(request: GenerationTestRequest):
-    """Тестовый эндпоинт для проверки генерации контента"""
+class GenerationRequest(BaseModel):
+    audience: str = "инвесторы"
+    presentation_type: str = "standard"
+    custom_slides: Optional[List[str]] = None
+    title: Optional[str] = None
+
+
+class GenerationResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+    estimated_time: Optional[int] = None
+
+
+class SlideContent(BaseModel):
+    slide_type: str
+    title: str
+    content: str
+    status: str
+
+
+class PresentationStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: int
+    slides_generated: List[SlideContent]
+    slides_count: Optional[int] = None  # ← ДОБАВИТЬ ЭТО
+    download_url: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+# ========== LLM ENDPOINTS ==========
+@router.post("/test-llm", response_model=GenerationTestResponse)
+async def test_llm_generation(request: GenerationTestRequest):
+    """Тестовый эндпоинт для проверки генерации контента LLM"""
     try:
         # Проверяем здоровье модели
         health = content_generator.health_check()
@@ -73,15 +112,15 @@ async def test_generation(request: GenerationTestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/model-status", response_model=ModelHealthResponse)
-async def get_model_status():
+@router.get("/llm-status", response_model=ModelHealthResponse)
+async def get_llm_status():
     """Статус LLM модели"""
     return content_generator.health_check()
 
 
-@router.post("/batch-test")
-async def batch_test_generation(test_cases: List[BatchTestRequest]):
-    """Пакетное тестирование генерации"""
+@router.post("/batch-test-llm")
+async def batch_test_llm_generation(test_cases: List[BatchTestRequest]):
+    """Пакетное тестирование генерации LLM"""
     results = {}
 
     for i, test_case in enumerate(test_cases):
@@ -91,11 +130,11 @@ async def batch_test_generation(test_cases: List[BatchTestRequest]):
             test_case.audience
         )
         results[f"test_{i}"] = {
-            "spec": test_case.dict(),
+            "spec": test_case.model_dump(),
             "result": result
         }
 
-    return BatchTestResponse(results=results)
+    return {"results": results}
 
 
 @router.get("/prompt-examples")
@@ -115,3 +154,306 @@ async def get_prompt_examples():
         }
 
     return examples
+
+
+# ========== PRESENTATION GENERATION ENDPOINTS ==========
+def _get_slides_structure(presentation_type: str, custom_slides: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """Возвращает структуру слайдов в зависимости от типа презентации"""
+
+    standard_structure = [
+        {"type": "title", "title": "Инвестиционная презентация"},
+        {"type": "problem", "title": "Проблема"},
+        {"type": "solution", "title": "Решение"},
+        {"type": "market", "title": "Рынок и возможности"},
+        {"type": "finance", "title": "Финансовые показатели"},
+        {"type": "team", "title": "Команда"},
+        {"type": "summary", "title": "Резюме и next steps"}
+    ]
+
+    minimal_structure = [
+        {"type": "title", "title": "Инвестиционная презентация"},
+        {"type": "problem", "title": "Проблема"},
+        {"type": "solution", "title": "Решение"},
+        {"type": "finance", "title": "Финансовые показатели"},
+        {"type": "summary", "title": "Резюме"}
+    ]
+
+    detailed_structure = standard_structure + [
+        {"type": "technology", "title": "Технологии"},
+        {"type": "roadmap", "title": "Дорожная карта"},
+        {"type": "risks", "title": "Риски и mitigation"}
+    ]
+
+    structures = {
+        "minimal": minimal_structure,
+        "standard": standard_structure,
+        "detailed": detailed_structure
+    }
+
+    return structures.get(presentation_type, standard_structure)
+
+
+def _search_relevant_context(slide_type: str, title: str) -> str:
+    """Ищет релевантный контекст для слайда в загруженных документах"""
+    search_queries = {
+        "title": "название проекта продукт компания",
+        "problem": "проблема задача боль потребность",
+        "solution": "решение продукт технология преимущества уникальность",
+        "market": "рынок объем тренды конкуренты аудитория",
+        "finance": "финансы выручка прибыль инвестиции окупаемость EBITDA",
+        "team": "команда опыт экспертиза компетенции участники",
+        "technology": "технологии стек разработка архитектура",
+        "roadmap": "дорожная карта этапы план сроки milestones",
+        "risks": "риски проблемы угрозы mitigation",
+        "summary": "резюме выводы итоги рекомендации",
+        "custom": title
+    }
+
+    query = search_queries.get(slide_type, title)
+    results = document_index.search(query, k=3)
+
+    context_parts = []
+    for content, content_type, source in results:
+        context_parts.append(f"[{content_type} из {source}]: {content}")
+
+    return "\n".join(context_parts) if context_parts else "Информация не найдена в загруженных документах"
+
+
+def _generate_presentation_task(job_id: str, request: GenerationRequest):
+    """Фоновая задача генерации презентации"""
+    try:
+        logger.info(f"Starting presentation generation for job {job_id}")
+
+        # Обновляем статус
+        generation_status[job_id].update({
+            "status": "processing",
+            "progress": 10,
+            "updated_at": datetime.now().isoformat()
+        })
+
+        # Проверяем что документы загружены
+        if not document_index.documents:
+            generation_status[job_id].update({
+                "status": "failed",
+                "error_message": "Сначала загрузите документы через /upload",
+                "updated_at": datetime.now().isoformat()
+            })
+            return
+
+        # Получаем структуру слайдов
+        slides_structure = _get_slides_structure(
+            request.presentation_type,
+            request.custom_slides
+        )
+
+        generation_status[job_id]["slides_generated"] = []
+        total_slides = len(slides_structure)
+
+        # Создаем билдер презентации
+        builder = PresentationBuilder()
+
+        # Генерируем контент для каждого слайда
+        for i, slide_spec in enumerate(slides_structure):
+            slide_type = slide_spec["type"]
+            slide_title = slide_spec["title"]
+
+            # Обновляем прогресс
+            progress = 10 + int((i / total_slides) * 80)
+            generation_status[job_id]["progress"] = progress
+
+            # Ищем релевантный контекст
+            context = _search_relevant_context(slide_type, slide_title)
+
+            # Генерируем контент через LLM
+            generation_result = content_generator.generate_slide_content(
+                slide_type, context, request.audience
+            )
+
+            # Сохраняем результат генерации
+            slide_content = SlideContent(
+                slide_type=slide_type,
+                title=slide_title,
+                content=generation_result["content"],
+                status=generation_result["status"]
+            )
+
+            generation_status[job_id]["slides_generated"].append(slide_content)
+
+            # Добавляем слайд в презентацию
+            builder.add_slide(
+                slide_type=slide_type,
+                title=slide_title,
+                content=generation_result["content"],
+                audience=request.audience
+            )
+
+            logger.info(f"Generated slide {i + 1}/{total_slides}: {slide_title}")
+
+        # Сохраняем презентацию
+        generation_status[job_id]["progress"] = 95
+        presentation_bytes = builder.save_to_bytes()
+
+        # Сохраняем файл в памяти
+        generation_status[job_id]["presentation_data"] = presentation_bytes.getvalue()
+        generation_status[job_id]["presentation_filename"] = f"presentation_{job_id}.pptx"
+
+        # Финальный статус
+        generation_status[job_id].update({
+            "status": "completed",
+            "progress": 100,
+            "download_url": f"/generate/download/{job_id}",
+            "updated_at": datetime.now().isoformat()
+        })
+
+        logger.info(f"Presentation generation completed for job {job_id}")
+
+    except Exception as e:
+        logger.error(f"Presentation generation failed for job {job_id}: {e}")
+        generation_status[job_id].update({
+            "status": "failed",
+            "error_message": str(e),
+            "updated_at": datetime.now().isoformat()
+        })
+
+
+@router.post("/presentation", response_model=GenerationResponse)
+async def generate_presentation(
+        request: GenerationRequest,
+        background_tasks: BackgroundTasks
+):
+    """Запускает генерацию презентации"""
+
+    # Проверяем что модель готова
+    model_health = content_generator.health_check()
+    if model_health["status"] not in ["healthy", "loaded"]:
+        raise HTTPException(
+            status_code=503,
+            detail=f"LLM модель не готова: {model_health}"
+        )
+
+    # Проверяем что документы загружены
+    if not document_index.documents:
+        raise HTTPException(
+            status_code=400,
+            detail="Сначала загрузите документы через /upload endpoint"
+        )
+
+    # Создаем job ID
+    job_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+
+    # Инициализируем статус
+    generation_status[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "progress": 0,
+        "slides_generated": [],
+        "download_url": None,
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+        "presentation_data": None,
+        "presentation_filename": None
+    }
+
+    # Запускаем фоновую задачу
+    background_tasks.add_task(_generate_presentation_task, job_id, request)
+
+    return GenerationResponse(
+        job_id=job_id,
+        status="pending",
+        message="Генерация презентации запущена",
+        estimated_time=len(document_index.documents) * 10
+    )
+
+
+@router.get("/status/{job_id}", response_model=PresentationStatusResponse)
+async def get_generation_status(job_id: str):
+    if job_id not in generation_status:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status_data = generation_status[job_id]
+
+    return PresentationStatusResponse(
+        job_id=status_data["job_id"],
+        status=status_data["status"],
+        progress=status_data["progress"],
+        slides_generated=status_data["slides_generated"],
+        slides_count=status_data.get("slides_count"),  # ← ДОБАВИТЬ
+        download_url=status_data["download_url"],
+        error_message=status_data.get("error_message"),
+        created_at=status_data["created_at"],
+        updated_at=status_data["updated_at"]
+    )
+
+
+@router.get("/download/{job_id}")
+async def download_presentation(job_id: str):
+    """Скачивает сгенерированную презентацию"""
+
+    if job_id not in generation_status:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status_data = generation_status[job_id]
+
+    if status_data["status"] != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Presentation not ready. Current status: {status_data['status']}"
+        )
+
+    if not status_data.get("presentation_data"):
+        raise HTTPException(status_code=404, detail="Presentation data not found")
+
+    presentation_bytes = io.BytesIO(status_data["presentation_data"])
+    filename = status_data["presentation_filename"]
+
+    return StreamingResponse(
+        presentation_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+@router.get("/jobs")
+async def list_jobs():
+    """Список всех jobs"""
+    return {
+        "jobs": list(generation_status.keys()),
+        "total": len(generation_status)
+    }
+
+
+@router.delete("/job/{job_id}")
+async def delete_job(job_id: str):
+    """Удаляет job из памяти"""
+    if job_id in generation_status:
+        del generation_status[job_id]
+        return {"message": f"Job {job_id} deleted"}
+    else:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+
+@router.get("/ready")
+async def check_generation_ready():
+    """Проверяет готовность системы к генерации"""
+    model_health = content_generator.health_check()
+
+    # Безопасная проверка document_index
+    try:
+        documents_loaded = len(document_index.documents) > 0
+        documents_count = len(document_index.documents)
+        index_built = document_index.is_built
+    except Exception as e:
+        logger.error(f"Error checking document index: {e}")
+        documents_loaded = False
+        documents_count = 0
+        index_built = False
+
+    return {
+        "ready": model_health["status"] in ["healthy", "loaded"] and documents_loaded,
+        "model_status": model_health,
+        "documents_loaded": documents_loaded,
+        "documents_count": documents_count,
+        "index_built": index_built
+    }
