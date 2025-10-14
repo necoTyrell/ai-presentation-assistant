@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 import logging
-from app.api import upload, generate
+from app.api import upload, generate, presentation_templates
 from app.core.embeddings import document_index
 from app.core.llm_generator import content_generator
 
@@ -30,6 +30,7 @@ app = FastAPI(
 # Подключаем только upload и generate
 app.include_router(upload.router, prefix="/upload", tags=["upload"])
 app.include_router(generate.router, prefix="/generate", tags=["generate"])
+app.include_router(presentation_templates.router, prefix="/upload", tags=["presentation_templates"])
 
 
 @app.get("/")

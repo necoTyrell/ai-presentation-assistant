@@ -6,6 +6,9 @@ import io
 import logging
 import uuid
 from datetime import datetime
+
+from app.api.presentation_templates import templates_store
+from app.core.powerpoint_templates.builder import TemplatePresentationBuilder
 from app.core.pptx_builder import PresentationBuilder
 from app.core.embeddings import document_index
 from app.core.llm_generator import content_generator
@@ -49,6 +52,7 @@ class ModelHealthResponse(BaseModel):
 class GenerationRequest(BaseModel):
     audience: str = "инвесторы"
     presentation_type: str = "standard"
+    template_id: Optional[str] = None
     custom_slides: Optional[List[str]] = None
     title: Optional[str] = None
 
@@ -210,13 +214,17 @@ def _search_relevant_context(slide_type: str, title: str) -> str:
     }
 
     query = search_queries.get(slide_type, title)
-    results = document_index.search(query, k=3)
+    results = document_index.search(query, k=2)  # ← УМЕНЬШИЛИ до 2 результатов
 
     context_parts = []
     for content, content_type, source in results:
-        context_parts.append(f"[{content_type} из {source}]: {content}")
+        # ОГРАНИЧИВАЕМ длину каждого результата
+        shortened_content = content[:300] + "..." if len(content) > 300 else content
+        context_parts.append(f"[{content_type} из {source}]: {shortened_content}")
 
-    return "\n".join(context_parts) if context_parts else "Информация не найдена в загруженных документах"
+    # ОБЩЕЕ ОГРАНИЧЕНИЕ КОНТЕКСТА
+    full_context = "\n".join(context_parts) if context_parts else "Информация не найдена в загруженных документах"
+    return full_context[:800]
 
 
 def _generate_presentation_task(job_id: str, request: GenerationRequest):
@@ -232,7 +240,7 @@ def _generate_presentation_task(job_id: str, request: GenerationRequest):
         })
 
         # Проверяем что документы загружены
-        if not document_index.documents:
+        if len(document_index.documents) == 0:
             generation_status[job_id].update({
                 "status": "failed",
                 "error_message": "Сначала загрузите документы через /upload",
@@ -246,11 +254,19 @@ def _generate_presentation_task(job_id: str, request: GenerationRequest):
             request.custom_slides
         )
 
+        # Создаем билдер - с шаблоном или без
+        if request.template_id and request.template_id in templates_store:
+            template_info = templates_store[request.template_id]
+            builder = TemplatePresentationBuilder(template_info["file_path"])
+            generation_status[job_id]["template_used"] = template_info["name"]
+            logger.info(f"Используется шаблон: {template_info['name']}")
+        else:
+            builder = PresentationBuilder()
+            generation_status[job_id]["template_used"] = "Стандартный"
+            logger.info("Используется стандартный билдер")
+
         generation_status[job_id]["slides_generated"] = []
         total_slides = len(slides_structure)
-
-        # Создаем билдер презентации
-        builder = PresentationBuilder()
 
         # Генерируем контент для каждого слайда
         for i, slide_spec in enumerate(slides_structure):
@@ -263,11 +279,14 @@ def _generate_presentation_task(job_id: str, request: GenerationRequest):
 
             # Ищем релевантный контекст
             context = _search_relevant_context(slide_type, slide_title)
+            logger.debug(f"Для слайда '{slide_title}' найден контекст: {context[:100]}...")
 
             # Генерируем контент через LLM
             generation_result = content_generator.generate_slide_content(
                 slide_type, context, request.audience
             )
+
+            logger.debug(f"LLM сгенерировал контент: {generation_result['content'][:100]}...")
 
             # Сохраняем результат генерации
             slide_content = SlideContent(
@@ -279,15 +298,31 @@ def _generate_presentation_task(job_id: str, request: GenerationRequest):
 
             generation_status[job_id]["slides_generated"].append(slide_content)
 
-            # Добавляем слайд в презентацию
-            builder.add_slide(
-                slide_type=slide_type,
-                title=slide_title,
-                content=generation_result["content"],
-                audience=request.audience
-            )
+            # Добавляем слайд используя шаблон
+            if hasattr(builder, 'add_slide_from_template'):
+                # Используем шаблонный билдер
+                builder.add_slide_from_template(
+                    slide_type=slide_type,
+                    title=slide_title,
+                    content=generation_result["content"],
+                    layout_index=i,  # Передаем индекс для циклического использования макетов
+                    audience=request.audience
+                )
+            else:
+                # Используем стандартный билдер
+                if slide_type == "title":
+                    builder.add_title_slide(
+                        title=slide_title,
+                        subtitle=f"Аудитория: {request.audience}\nСгенерировано AI Assistant"
+                    )
+                else:
+                    builder.add_content_slide(
+                        title=slide_title,
+                        content=generation_result["content"],
+                        content_type="bullets" if slide_type in ["solution", "summary"] else "text"
+                    )
 
-            logger.info(f"Generated slide {i + 1}/{total_slides}: {slide_title}")
+            logger.info(f"Сгенерирован слайд {i + 1}/{total_slides}: {slide_title}")
 
         # Сохраняем презентацию
         generation_status[job_id]["progress"] = 95
@@ -295,7 +330,9 @@ def _generate_presentation_task(job_id: str, request: GenerationRequest):
 
         # Сохраняем файл в памяти
         generation_status[job_id]["presentation_data"] = presentation_bytes.getvalue()
-        generation_status[job_id]["presentation_filename"] = f"presentation_{job_id}.pptx"
+        template_suffix = f"_{request.template_id[:8]}" if request.template_id else ""
+        generation_status[job_id]["presentation_filename"] = f"presentation{template_suffix}_{job_id[:8]}.pptx"
+        generation_status[job_id]["slides_count"] = builder.get_slide_count()
 
         # Финальный статус
         generation_status[job_id].update({
@@ -305,10 +342,10 @@ def _generate_presentation_task(job_id: str, request: GenerationRequest):
             "updated_at": datetime.now().isoformat()
         })
 
-        logger.info(f"Presentation generation completed for job {job_id}")
+        logger.info(f"Презентация успешно сгенерирована. Слайдов: {builder.get_slide_count()}")
 
     except Exception as e:
-        logger.error(f"Presentation generation failed for job {job_id}: {e}")
+        logger.error(f"Ошибка генерации презентации: {e}")
         generation_status[job_id].update({
             "status": "failed",
             "error_message": str(e),
