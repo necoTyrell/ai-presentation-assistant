@@ -5,7 +5,7 @@ from typing import List
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pathlib import Path
 from pydantic import BaseModel
-from app.core.powerpoint_templates.analyzer import analyze_template
+from app.core.presentation_analyzer import analyze_template
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
